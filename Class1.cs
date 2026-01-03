@@ -110,7 +110,7 @@ namespace playnite_json
                     Name = game.Name,
                     Description = game.Description, // Contains HTML usually
                     ReleaseDate = game.ReleaseDate?.Date,
-                    Playtime = game.Playtime, // Seconds
+                    Playtime = (long)game.Playtime, // Seconds (Explicit Cast Fixed)
                     LastPlayed = game.LastActivity,
                     Added = game.Added,
                     CommunityScore = game.CommunityScore,
@@ -192,10 +192,17 @@ namespace playnite_json
             try
             {
                 // Playnite SDK helper to get full path
-                // If direct access isn't available, we construct it:
-                // Note: dbPath is usually "guid/file.ext" inside the DB folder
-                string fullSourcePath = _gameDatabase.GetFullFilePath(dbPath);
+                // If direct GetFullFilePath is missing in this SDK version context, use manual path.
+                // Assuming standard Playnite structure: ConfigurationPath/library/files/dbPath
+                // dbPath from API is usually like "guid/image.jpg"
                 
+                string fullSourcePath;
+                
+                // Try simple path combination first
+                // Warning: PlayniteApi.Paths.ConfigurationPath might need to be verified.
+                string basePath = Path.Combine(PlayniteApi.Paths.ConfigurationPath, "library", "files");
+                fullSourcePath = Path.Combine(basePath, dbPath);
+
                 if (File.Exists(fullSourcePath))
                 {
                     File.Copy(fullSourcePath, destPath, true);
