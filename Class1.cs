@@ -1,16 +1,16 @@
 using Playnite.SDK;
 using Playnite.SDK.Plugins;
 using Playnite.SDK.Events;
+using Playnite.SDK.Models;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using Newtonsoft.Json;
-using System.Net;
-using System.Text;
-using System.Runtime.InteropServices;
 using System.Windows;
 using System.Threading.Tasks;
+using System.Runtime.InteropServices;
 
 namespace playnite_json
 {
@@ -18,12 +18,7 @@ namespace playnite_json
     public class ExportGamesPlugin : GenericPlugin
     {
         private readonly IGameDatabase _gameDatabase;
-        private readonly Guid steamPluginId = Guid.Parse("cb91dfc9-b977-43bf-8e70-55f46e410fab");
         private static readonly ILogger Logger = LogManager.GetLogger();
-
-        private const string ClientId = "ENV";
-        private const string ClientSecret = "ENV";
-        private string _igdbAccessToken;
 
         public ExportGamesPlugin(IPlayniteAPI api) : base(api)
         {
@@ -32,216 +27,186 @@ namespace playnite_json
 
         public override Guid Id { get; } = new Guid("1B6AA61E-561C-47F4-9AED-15FFEB574CF4");
 
+        public override IEnumerable<MainMenuItem> GetMainMenuItems(GetMainMenuItemsArgs args)
+        {
+            yield return new MainMenuItem
+            {
+                Description = "Export Library for Mobile (Zip)",
+                MenuSection = "@Mobile Export",
+                Action = (a) =>
+                {
+                    ExportLibrary();
+                }
+            };
+        }
+
         public override void OnApplicationStarted(OnApplicationStartedEventArgs args)
         {
-            base.OnApplicationStarted(args);
+            // Optional: Auto-prompt on start can be annoying, moved to menu item.
+        }
 
+        private void ExportLibrary()
+        {
             var result = PlayniteApi.Dialogs.ShowMessage(
-                "Do you want to export your game library?",
-                "Confirm Export",
+                "This will export your library metadata and images to a Zip file for the mobile app.\nThis may take a while depending on your library size.",
+                "Start Mobile Export?",
                 MessageBoxButton.YesNo
             );
 
-            if (result != MessageBoxResult.Yes)
-            {
-                Logger.Info("Game export canceled by user.");
-                return;
-            }
+            if (result != MessageBoxResult.Yes) return;
 
             PlayniteApi.Notifications.Add(new NotificationMessage(
-                "playnite-json-export-started",
-                "Game export started in the background.",
+                "mobile-export-start",
+                "Mobile export started...",
                 NotificationType.Info
             ));
 
             Task.Run(() =>
             {
-                _igdbAccessToken = GetIgdbAccessToken();
-                ExportGamesToJson();
+                try
+                {
+                    PerformExport();
+                    PlayniteApi.Notifications.Add(new NotificationMessage(
+                        "mobile-export-success",
+                        "Library exported successfully to 'MobileExport.zip'!",
+                        NotificationType.Info
+                    ));
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error(ex, "Mobile export failed.");
+                    PlayniteApi.Notifications.Add(new NotificationMessage(
+                        "mobile-export-error",
+                        $"Export failed: {ex.Message}",
+                        NotificationType.Error
+                    ));
+                }
             });
         }
 
-        private void ExportGamesToJson()
+        private void PerformExport()
         {
-            try
+            // 1. Setup Paths
+            string exportRoot = Path.Combine(PlayniteApi.Paths.ApplicationPath, "MobileExportTemp");
+            string imagesRoot = Path.Combine(exportRoot, "images");
+            string jsonPath = Path.Combine(exportRoot, "library.json");
+            string zipPath = Path.Combine(PlayniteApi.Paths.ApplicationPath, "MobileExport.zip");
+
+            // Clean up previous runs
+            if (Directory.Exists(exportRoot)) Directory.Delete(exportRoot, true);
+            if (File.Exists(zipPath)) File.Delete(zipPath);
+
+            Directory.CreateDirectory(exportRoot);
+            Directory.CreateDirectory(imagesRoot);
+
+            var games = _gameDatabase.Games;
+            var exportList = new List<GameInfo>();
+
+            foreach (var game in games)
             {
-                string filePath = Path.Combine(PlayniteApi.Paths.ApplicationPath, "games_export.json");
-                Logger.Info($"Export file path: {filePath}");
-
-                List<GameInfo> existingGames = null;
-
-                if (File.Exists(filePath))
+                var info = new GameInfo
                 {
-                    try
-                    {
-                        string existingJson = File.ReadAllText(filePath);
-                        existingGames = JsonConvert.DeserializeObject<List<GameInfo>>(existingJson) ?? new List<GameInfo>();
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Error(ex, "Failed to read existing JSON file.");
-                        existingGames = new List<GameInfo>();
-                    }
+                    Id = game.Id,
+                    Name = game.Name,
+                    Description = game.Description, // Contains HTML usually
+                    ReleaseDate = game.ReleaseDate?.Date,
+                    Playtime = game.Playtime, // Seconds
+                    LastPlayed = game.LastActivity,
+                    Added = game.Added,
+                    CommunityScore = game.CommunityScore,
+                    CriticScore = game.CriticScore,
+                    UserScore = game.UserScore,
+                    Hidden = game.Hidden,
+                    Favorite = game.Favorite,
+                    InstallDirectory = game.InstallDirectory,
+                    IsInstalled = game.IsInstalled
+                };
+
+                // Map Linked Data (Ids -> Names)
+                info.Platform = game.PlatformIds?.Select(id => _gameDatabase.Platforms.Get(id)?.Name).Where(n => n != null).ToList();
+                info.Developers = game.DeveloperIds?.Select(id => _gameDatabase.Companies.Get(id)?.Name).Where(n => n != null).ToList();
+                info.Publishers = game.PublisherIds?.Select(id => _gameDatabase.Companies.Get(id)?.Name).Where(n => n != null).ToList();
+                info.Genres = game.GenreIds?.Select(id => _gameDatabase.Genres.Get(id)?.Name).Where(n => n != null).ToList();
+                info.Tags = game.TagIds?.Select(id => _gameDatabase.Tags.Get(id)?.Name).Where(n => n != null).ToList();
+                info.Features = game.FeatureIds?.Select(id => _gameDatabase.Features.Get(id)?.Name).Where(n => n != null).ToList();
+                info.Series = game.SeriesIds?.Select(id => _gameDatabase.Series.Get(id)?.Name).Where(n => n != null).ToList();
+                info.AgeRating = game.AgeRatingIds?.Select(id => _gameDatabase.AgeRatings.Get(id)?.Name).Where(n => n != null).ToList();
+                
+                if (game.SourceId != Guid.Empty)
+                    info.Source = _gameDatabase.Sources.Get(game.SourceId)?.Name;
+                
+                if (game.CompletionStatusId != Guid.Empty)
+                    info.CompletionStatus = _gameDatabase.CompletionStatuses.Get(game.CompletionStatusId)?.Name;
+
+                // Handle Links
+                if (game.Links != null)
+                {
+                    info.Links = game.Links.ToDictionary(l => l.Name, l => l.Url);
                 }
 
-                var games = _gameDatabase.Games;
-                var gameList = new List<GameInfo>();
-                int totalGames = games.Count();
-                int processed = 0;
-                bool changesDetected = false;
+                // Handle Images (Copy to export folder)
+                // Using game.Id as subfolder to avoid collisions
+                string gameImgPath = Path.Combine(imagesRoot, game.Id.ToString());
+                bool hasImages = false;
 
-                foreach (var game in games)
+                if (!string.IsNullOrEmpty(game.CoverImage))
                 {
-                    processed++;
-
-                    var platformName = game.PlatformIds?.Any() == true
-                        ? _gameDatabase.Platforms.Get(game.PlatformIds.First())?.Name ?? "Unknown"
-                        : "Unknown";
-
-                    var sourceName = game.Source?.Name ?? "Unknown";
-                    string steamId = game.PluginId == steamPluginId ? game.GameId : null;
-
-                    string coverArtUrl = GetIgdbCoverUrl(game.Name) ??
-                                         (steamId != null ? $"https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/{steamId}/library_600x900.jpg"
-                                                          : "https://placehold.co/60x60.svg");
-
-                    var communityHubUrl = game.Links?.FirstOrDefault(link => link.Name.Contains("Community"))?.Url;
-
-                    var newGame = new GameInfo
-                    {
-                        Id = game.Id,
-                        Name = game.Name,
-                        Description = game.Description,
-                        Platform = platformName,
-                        Playtime = (long?)game.Playtime,
-                        LastPlayed = game.LastActivity,
-                        Genres = game.Genres?.Select(g => g.Name).ToList(),
-                        Sources = sourceName,
-                        ReleaseDate = game.ReleaseDate?.Date,
-                        CommunityHubUrl = communityHubUrl,
-                        Added = game.Added,
-                        SteamId = steamId,
-                        CoverArtUrl = coverArtUrl,
-                        CommunityScore = game.CommunityScore,
-                        CriticScore = game.CriticScore,
-                        UserScore = game.UserScore
-                    };
-
-                    var existingGame = existingGames?.FirstOrDefault(g => g.Id == newGame.Id);
-                    if (existingGame != null)
-                    {
-                        if (!JsonConvert.SerializeObject(existingGame).Equals(JsonConvert.SerializeObject(newGame)))
-                        {
-                            Logger.Info($"Updating game: {newGame.Name}");
-                            gameList.Add(newGame);
-                            changesDetected = true;
-                        }
-                        else
-                        {
-                            gameList.Add(existingGame);
-                        }
-                    }
-                    else
-                    {
-                        Logger.Info($"Adding new game: {newGame.Name}");
-                        gameList.Add(newGame);
-                        changesDetected = true;
-                    }
+                    if (!hasImages) { Directory.CreateDirectory(gameImgPath); hasImages = true; }
+                    string dest = Path.Combine(gameImgPath, "cover" + Path.GetExtension(game.CoverImage));
+                    if (CopyDatabaseImage(game.CoverImage, dest))
+                        info.CoverImage = $"images/{game.Id}/cover{Path.GetExtension(game.CoverImage)}";
                 }
 
-                if (!changesDetected)
+                if (!string.IsNullOrEmpty(game.BackgroundImage))
                 {
-                    Logger.Info("No changes detected, skipping save.");
-                    PlayniteApi.Notifications.Add(new NotificationMessage(
-                        "playnite-json-no-changes",
-                        $"No changes detected — existing export is up to date. Location: {filePath}",
-                        NotificationType.Info
-                    ));
-                    return;
+                    if (!hasImages) { Directory.CreateDirectory(gameImgPath); hasImages = true; }
+                    string dest = Path.Combine(gameImgPath, "background" + Path.GetExtension(game.BackgroundImage));
+                    if (CopyDatabaseImage(game.BackgroundImage, dest))
+                        info.BackgroundImage = $"images/{game.Id}/background{Path.GetExtension(game.BackgroundImage)}";
                 }
 
-                string json = JsonConvert.SerializeObject(gameList, Formatting.Indented);
-                File.WriteAllText(filePath, json);
+                if (!string.IsNullOrEmpty(game.Icon))
+                {
+                    if (!hasImages) { Directory.CreateDirectory(gameImgPath); hasImages = true; }
+                    string dest = Path.Combine(gameImgPath, "icon" + Path.GetExtension(game.Icon));
+                    if (CopyDatabaseImage(game.Icon, dest))
+                        info.Icon = $"images/{game.Id}/icon{Path.GetExtension(game.Icon)}";
+                }
 
-                PlayniteApi.Notifications.Add(new NotificationMessage(
-                    "playnite-json-export-complete",
-                    $"Export complete! {processed} games saved to: {filePath}",
-                    NotificationType.Info
-                ));
+                exportList.Add(info);
             }
-            catch (Exception ex)
-            {
-                Logger.Error(ex, "Failed to export games.");
-                PlayniteApi.Notifications.Add(new NotificationMessage(
-                    "playnite-json-export-error",
-                    $"An error occurred: {ex.Message}",
-                    NotificationType.Error
-                ));
-            }
+
+            // Write JSON
+            string json = JsonConvert.SerializeObject(exportList, Formatting.Indented);
+            File.WriteAllText(jsonPath, json);
+
+            // Create Zip
+            ZipFile.CreateFromDirectory(exportRoot, zipPath);
+
+            // Cleanup Temp
+            Directory.Delete(exportRoot, true);
         }
 
-        private string GetIgdbAccessToken()
+        private bool CopyDatabaseImage(string dbPath, string destPath)
         {
             try
             {
-                using (var client = new WebClient())
+                // Playnite SDK helper to get full path
+                // If direct access isn't available, we construct it:
+                // Note: dbPath is usually "guid/file.ext" inside the DB folder
+                string fullSourcePath = _gameDatabase.GetFullFilePath(dbPath);
+                
+                if (File.Exists(fullSourcePath))
                 {
-                    var values = new System.Collections.Specialized.NameValueCollection
-                    {
-                        { "client_id", ClientId },
-                        { "client_secret", ClientSecret },
-                        { "grant_type", "client_credentials" }
-                    };
-
-                    var response = client.UploadValues("https://id.twitch.tv/oauth2/token", values);
-                    var responseString = Encoding.Default.GetString(response);
-                    var json = JsonConvert.DeserializeObject<Dictionary<string, string>>(responseString);
-
-                    return json["access_token"];
+                    File.Copy(fullSourcePath, destPath, true);
+                    return true;
                 }
             }
             catch (Exception ex)
             {
-                Logger.Error(ex, "Failed to get IGDB access token.");
-                PlayniteApi.Notifications.Add(new NotificationMessage(
-                    "playnite-json-igdb-error",
-                    $"Failed to get IGDB token: {ex.Message}",
-                    NotificationType.Error
-                ));
-                return null;
+                Logger.Warn(ex, $"Failed to copy image: {dbPath}");
             }
-        }
-
-        private string GetIgdbCoverUrl(string gameName)
-        {
-            if (string.IsNullOrEmpty(_igdbAccessToken))
-                return null;
-
-            try
-            {
-                using (var client = new WebClient())
-                {
-                    client.Headers.Add("Client-ID", ClientId);
-                    client.Headers.Add("Authorization", $"Bearer {_igdbAccessToken}");
-                    client.Headers.Add("Accept", "application/json");
-
-                    string query = $"search \"{gameName}\"; fields cover.image_id; limit 1;";
-                    var response = client.UploadString("https://api.igdb.com/v4/games", query);
-                    var games = JsonConvert.DeserializeObject<List<dynamic>>(response);
-
-                    if (games.Count > 0 && games[0].cover != null)
-                    {
-                        string imageId = games[0].cover.image_id.ToString();
-                        return $"https://images.igdb.com/igdb/image/upload/t_cover_big/{imageId}.jpg";
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.Error(ex, $"Failed to fetch IGDB cover for {gameName}.");
-            }
-
-            return null;
+            return false;
         }
 
         private class GameInfo
@@ -249,19 +214,36 @@ namespace playnite_json
             public Guid Id { get; set; }
             public string Name { get; set; }
             public string Description { get; set; }
-            public string Platform { get; set; }
-            public long? Playtime { get; set; }
+            public long Playtime { get; set; }
             public DateTime? LastPlayed { get; set; }
-            public List<string> Genres { get; set; }
-            public string Sources { get; set; }
-            public DateTime? ReleaseDate { get; set; }
-            public string CommunityHubUrl { get; set; }
             public DateTime? Added { get; set; }
-            public string SteamId { get; set; }
-            public string CoverArtUrl { get; set; }
-            public float? CommunityScore { get; set; }
+            public DateTime? ReleaseDate { get; set; }
+            public bool Hidden { get; set; }
+            public bool Favorite { get; set; }
+            public bool IsInstalled { get; set; }
+            public string InstallDirectory { get; set; }
+
+            public string Source { get; set; }
+            public string CompletionStatus { get; set; }
+            
+            public List<string> Platform { get; set; }
+            public List<string> Developers { get; set; }
+            public List<string> Publishers { get; set; }
+            public List<string> Genres { get; set; }
+            public List<string> Tags { get; set; }
+            public List<string> Features { get; set; }
+            public List<string> Series { get; set; }
+            public List<string> AgeRating { get; set; }
+
+            public Dictionary<string, string> Links { get; set; }
+
+            public string CoverImage { get; set; }
+            public string BackgroundImage { get; set; }
+            public string Icon { get; set; }
+
+            public int? CommunityScore { get; set; }
             public int? CriticScore { get; set; }
-            public float? UserScore { get; set; }
+            public int? UserScore { get; set; }
         }
     }
 }
